@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NocoBase Cross Env
 // @namespace    https://nocobase.com/
-// @version      0.3.3
+// @version      0.3.4
 // @description  在 NocoBase 实例 A 上，将前端请求桥接到实例 B，并支持目标子应用。
 // @author       gchust
 // @homepageURL   https://github.com/gchust/nocobase-cross-env-userscript
@@ -100,7 +100,8 @@
     if (!Number.isFinite(left) || !Number.isFinite(top)) {
       return null;
     }
-    return { left, top };
+    const edge = ['left', 'right', 'top', 'bottom'].includes(position.edge) ? position.edge : undefined;
+    return { left, top, edge };
   }
 
   function isRecord(value) {
@@ -2349,27 +2350,54 @@
         z-index: 2147483647;
         font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         color: #1f2937;
+        transition: left 180ms ease, top 180ms ease, right 180ms ease, bottom 180ms ease;
       }
       .nbce-toggle {
         display: inline-flex;
         align-items: center;
-        gap: 8px;
+        justify-content: center;
+        width: 38px;
+        height: 38px;
+        box-sizing: border-box;
         border: 1px solid rgba(15, 23, 42, 0.18);
         border-radius: 999px;
-        padding: 10px 14px;
         background: rgba(255, 255, 255, 0.96);
         box-shadow: 0 12px 32px rgba(15, 23, 42, 0.16);
         cursor: move;
         user-select: none;
-        font-size: 12px;
+        font-size: 13px;
+        font-weight: 800;
         line-height: 1;
+        color: #0f172a;
+        opacity: 0.82;
+        transition: opacity 160ms ease, transform 160ms ease, box-shadow 160ms ease;
       }
-      .nbce-toggle strong {
-        font-weight: 700;
+      .nbce-toggle:hover,
+      .nbce-shell.expanded .nbce-toggle {
+        opacity: 1;
+        transform: translateX(0) translateY(0);
+        box-shadow: 0 14px 36px rgba(15, 23, 42, 0.2);
+      }
+      .nbce-shell.collapsed.edge-left .nbce-toggle {
+        transform: translateX(-18px);
+      }
+      .nbce-shell.collapsed.edge-right .nbce-toggle {
+        transform: translateX(18px);
+      }
+      .nbce-shell.collapsed.edge-top .nbce-toggle {
+        transform: translateY(-18px);
+      }
+      .nbce-shell.collapsed.edge-bottom .nbce-toggle {
+        transform: translateY(18px);
+      }
+      .nbce-toggle-mark {
+        display: block;
+        letter-spacing: 0;
+        pointer-events: none;
       }
       .nbce-card {
         width: 360px;
-        margin-top: 12px;
+        margin-top: 10px;
         border-radius: 8px;
         border: 1px solid rgba(15, 23, 42, 0.14);
         background: rgba(255, 255, 255, 0.98);
@@ -2487,9 +2515,8 @@
     const shell = document.createElement('div');
     shell.className = 'nbce-shell';
     shell.innerHTML = `
-      <div id="${PANEL_TOGGLE_ID}" class="nbce-toggle" title="点击展开，拖拽移动">
-        <strong>NB Cross Env</strong>
-        <span>${currentRule?.enabled ? '已启用' : '配置 B 实例'}</span>
+      <div id="${PANEL_TOGGLE_ID}" class="nbce-toggle" title="NocoBase Cross Env：点击展开，拖拽移动">
+        <span class="nbce-toggle-mark">NB</span>
       </div>
       <div class="nbce-card" ${state.expanded ? '' : 'hidden'}>
         <div class="nbce-header">
@@ -2530,15 +2557,46 @@
     input.value = state.targetUrl;
     status.textContent = state.status;
 
-    function clampPanelPosition(left, top) {
+    function getShellSize() {
       const rect = shell.getBoundingClientRect();
+      return {
+        width: Math.max(rect.width || 0, 38),
+        height: Math.max(rect.height || 0, 38),
+      };
+    }
+
+    function clampPanelPosition(left, top) {
+      const size = getShellSize();
       const margin = 8;
-      const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
-      const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+      const maxLeft = Math.max(margin, window.innerWidth - size.width - margin);
+      const maxTop = Math.max(margin, window.innerHeight - size.height - margin);
       return {
         left: Math.min(Math.max(margin, left), maxLeft),
         top: Math.min(Math.max(margin, top), maxTop),
       };
+    }
+
+    function snapPanelPosition(left, top) {
+      const size = getShellSize();
+      const margin = 8;
+      const distances = [
+        { edge: 'left', value: left },
+        { edge: 'right', value: window.innerWidth - left - size.width },
+        { edge: 'top', value: top },
+        { edge: 'bottom', value: window.innerHeight - top - size.height },
+      ];
+      const nearest = distances.reduce((result, item) => (item.value < result.value ? item : result), distances[0]);
+      const clamped = clampPanelPosition(left, top);
+      if (nearest.edge === 'left') {
+        return { left: margin, top: clamped.top, edge: 'left' };
+      }
+      if (nearest.edge === 'right') {
+        return { left: Math.max(margin, window.innerWidth - size.width - margin), top: clamped.top, edge: 'right' };
+      }
+      if (nearest.edge === 'top') {
+        return { left: clamped.left, top: margin, edge: 'top' };
+      }
+      return { left: clamped.left, top: Math.max(margin, window.innerHeight - size.height - margin), edge: 'bottom' };
     }
 
     function applyPanelPosition() {
@@ -2547,14 +2605,21 @@
         shell.style.top = '';
         shell.style.right = '16px';
         shell.style.bottom = '16px';
+        shell.classList.toggle('expanded', state.expanded);
+        shell.classList.toggle('collapsed', !state.expanded);
+        shell.classList.add('edge-right');
         return;
       }
       const position = clampPanelPosition(state.position.left, state.position.top);
-      state.position = position;
+      state.position = { ...state.position, ...position };
       shell.style.left = `${position.left}px`;
       shell.style.top = `${position.top}px`;
       shell.style.right = 'auto';
       shell.style.bottom = 'auto';
+      shell.classList.toggle('expanded', state.expanded);
+      shell.classList.toggle('collapsed', !state.expanded);
+      ['edge-left', 'edge-right', 'edge-top', 'edge-bottom'].forEach((className) => shell.classList.remove(className));
+      shell.classList.add(`edge-${state.position.edge || 'right'}`);
     }
 
     function render() {
@@ -2613,6 +2678,8 @@
       event.currentTarget.releasePointerCapture?.(event.pointerId);
       if (dragState.moved) {
         suppressNextToggleClick = true;
+        state.position = snapPanelPosition(state.position.left, state.position.top);
+        applyPanelPosition();
         void savePanelPosition(state.position);
         window.setTimeout(() => {
           suppressNextToggleClick = false;
@@ -2630,7 +2697,9 @@
 
     window.addEventListener('resize', () => {
       if (state.position) {
-        state.position = clampPanelPosition(state.position.left, state.position.top);
+        state.position = state.expanded
+          ? clampPanelPosition(state.position.left, state.position.top)
+          : snapPanelPosition(state.position.left, state.position.top);
         applyPanelPosition();
         void savePanelPosition(state.position);
       }
@@ -2642,6 +2711,12 @@
         return;
       }
       state.expanded = !state.expanded;
+      if (state.position) {
+        render();
+        state.position = state.expanded
+          ? clampPanelPosition(state.position.left, state.position.top)
+          : snapPanelPosition(state.position.left, state.position.top);
+      }
       render();
     });
 
