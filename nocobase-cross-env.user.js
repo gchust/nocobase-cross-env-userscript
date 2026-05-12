@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NocoBase Cross Env
 // @namespace    https://nocobase.com/
-// @version      0.3.5
+// @version      0.3.6
 // @description  在 NocoBase 实例 A 上，将前端请求桥接到实例 B，并支持目标子应用。
 // @author       gchust
 // @homepageURL   https://github.com/gchust/nocobase-cross-env-userscript
@@ -2961,6 +2961,7 @@
         min-width: 0;
         color: #0f172a;
         word-break: break-all;
+        white-space: pre-wrap;
       }
       .nbce-debug-textarea {
         box-sizing: border-box;
@@ -3179,6 +3180,43 @@
       }
     }
 
+    function formatDebugUrlPath(value) {
+      try {
+        const url = new URL(value, location.origin);
+        return `${url.origin}${safeDecodeURIComponent(url.pathname)}`;
+      } catch (error) {
+        return safeDecodeURIComponent(value || '');
+      }
+    }
+
+    function formatDebugQueryValue(value) {
+      const text = `${value ?? ''}`;
+      const trimmed = text.trim();
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        try {
+          return JSON.stringify(JSON.parse(trimmed), null, 2);
+        } catch (error) {
+          return text;
+        }
+      }
+      return text;
+    }
+
+    function formatDebugQuery(value) {
+      let url;
+      try {
+        url = new URL(value, location.origin);
+      } catch (error) {
+        return '';
+      }
+      const rows = [];
+      url.searchParams.forEach((paramValue, paramName) => {
+        const formattedValue = formatDebugQueryValue(paramValue);
+        rows.push(`${paramName} = ${formattedValue.includes('\n') ? `\n${formattedValue}` : formattedValue}`);
+      });
+      return rows.join('\n\n');
+    }
+
     function setSelectedDebugLog(log) {
       state.selectedDebugLogId = log?.id || '';
       state.debugStatus = '';
@@ -3239,15 +3277,23 @@
       }
 
       const rule = getDebugRuleForLog(selectedLog);
+      const queryText = formatDebugQuery(selectedLog.url);
       const metaRows = [
         ['Endpoint', `${selectedLog.method} ${selectedLog.endpoint || '-'}`],
         ['Status', selectedLog.ok ? `${selectedLog.status || 0} ${selectedLog.statusText || ''}`.trim() : '请求失败'],
         ['Duration', `${selectedLog.durationMs} ms`],
         ['Override', selectedLog.overridden ? '已命中本地改写' : rule ? '已有本地改写规则' : '无'],
-        ['URL', selectedLog.url],
+        ['URL', formatDebugUrlPath(selectedLog.url)],
       ];
+      if (queryText) {
+        metaRows.push(['Query', queryText]);
+      }
       if (selectedLog.originalUrl && selectedLog.originalUrl !== selectedLog.url) {
-        metaRows.push(['Original', selectedLog.originalUrl]);
+        metaRows.push(['Original', formatDebugUrlPath(selectedLog.originalUrl)]);
+        const originalQueryText = formatDebugQuery(selectedLog.originalUrl);
+        if (originalQueryText && originalQueryText !== queryText) {
+          metaRows.push(['Original Query', originalQueryText]);
+        }
       }
       if (selectedLog.requestBodySummary) {
         metaRows.push(['Body', selectedLog.requestBodySummary]);
