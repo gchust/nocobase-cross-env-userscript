@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NocoBase Cross Env
 // @namespace    https://nocobase.com/
-// @version      0.3.4
+// @version      0.3.5
 // @description  在 NocoBase 实例 A 上，将前端请求桥接到实例 B，并支持目标子应用。
 // @author       gchust
 // @homepageURL   https://github.com/gchust/nocobase-cross-env-userscript
@@ -23,11 +23,17 @@
 
   const STORAGE_KEY = 'nbce.rules.v1';
   const PANEL_POSITION_KEY = 'nbce.panelPosition.v1';
+  const DEBUG_RULES_KEY = 'nbce.debugRules.v1';
   const PANEL_ROOT_ID = 'nbce-panel-root';
   const PANEL_TOGGLE_ID = 'nbce-panel-toggle';
   const BRIDGE_EVENT_TYPE = '__NBCE_USERSCRIPT_BRIDGE__';
   const BRIDGE_REPLY_TYPE = '__NBCE_USERSCRIPT_BRIDGE_REPLY__';
+  const DEBUG_LOG_LIMIT = 80;
+  const DEBUG_TEXT_LIMIT = 2000;
+  const DEBUG_RESPONSE_TEXT_LIMIT = 200000;
   const pendingBridgeRequests = new Map();
+  const debugLogs = [];
+  const debugLogListeners = new Set();
 
   const rules = loadRules();
   const currentRule = normalizeRule(rules[location.origin] || null);
@@ -88,6 +94,234 @@
     const positions = loadPanelPositions();
     positions[location.origin] = position;
     return Promise.resolve(GM_setValue(PANEL_POSITION_KEY, positions));
+  }
+
+  function loadDebugRulesStore() {
+    try {
+      const value = typeof GM_getValue === 'function' ? GM_getValue(DEBUG_RULES_KEY, {}) : {};
+      return isRecord(value) ? value : {};
+    } catch (error) {
+      console.warn('[nbce] failed to load debug rules', error);
+      return {};
+    }
+  }
+
+  function saveDebugRulesStore(nextStore) {
+    if (typeof GM_setValue === 'function') {
+      return Promise.resolve(GM_setValue(DEBUG_RULES_KEY, nextStore));
+    }
+    return Promise.resolve();
+  }
+
+  function buildDebugRuleKey(method, endpoint) {
+    return `${`${method || 'GET'}`.toUpperCase()} ${`${endpoint || ''}`.trim()}`;
+  }
+
+  function normalizeDebugRule(rule) {
+    if (!isRecord(rule) || rule.mode !== 'responseOverride') {
+      return null;
+    }
+    const method = `${rule.method || 'GET'}`.toUpperCase();
+    const endpoint = `${rule.endpoint || ''}`.trim();
+    if (!endpoint || typeof rule.responseText !== 'string') {
+      return null;
+    }
+    return {
+      id: rule.id || buildDebugRuleKey(method, endpoint),
+      key: rule.key || buildDebugRuleKey(method, endpoint),
+      mode: 'responseOverride',
+      enabled: rule.enabled !== false,
+      method,
+      endpoint,
+      responseText: rule.responseText,
+      status: Number(rule.status) || 200,
+      statusText: rule.statusText || 'OK',
+      responseHeaders: rule.responseHeaders || 'content-type: application/json\r\nx-nbce-debug: response-override\r\n',
+      createdAt: rule.createdAt || new Date().toISOString(),
+      updatedAt: rule.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  function getDebugRulesForOrigin(origin = location.origin) {
+    const store = loadDebugRulesStore();
+    const originRules = isRecord(store[origin]) ? store[origin] : {};
+    const normalized = {};
+    Object.entries(originRules).forEach(([key, rule]) => {
+      const nextRule = normalizeDebugRule({ key, ...rule });
+      if (nextRule) {
+        normalized[nextRule.key] = nextRule;
+      }
+    });
+    return normalized;
+  }
+
+  async function saveDebugRuleForOrigin(rule, origin = location.origin) {
+    const normalizedRule = normalizeDebugRule(rule);
+    if (!normalizedRule) {
+      throw new Error('调试规则无效');
+    }
+    const store = loadDebugRulesStore();
+    const originRules = isRecord(store[origin]) ? store[origin] : {};
+    originRules[normalizedRule.key] = normalizedRule;
+    store[origin] = originRules;
+    await saveDebugRulesStore(store);
+    notifyDebugLogListeners();
+    return normalizedRule;
+  }
+
+  async function deleteDebugRuleForOrigin(method, endpoint, origin = location.origin) {
+    const store = loadDebugRulesStore();
+    const originRules = isRecord(store[origin]) ? store[origin] : {};
+    const key = buildDebugRuleKey(method, endpoint);
+    delete originRules[key];
+    store[origin] = originRules;
+    await saveDebugRulesStore(store);
+    notifyDebugLogListeners();
+  }
+
+  async function clearDebugRulesForOrigin(origin = location.origin) {
+    const store = loadDebugRulesStore();
+    store[origin] = {};
+    await saveDebugRulesStore(store);
+    notifyDebugLogListeners();
+  }
+
+  function findDebugResponseOverride(method, endpoint) {
+    const key = buildDebugRuleKey(method, endpoint);
+    const rule = getDebugRulesForOrigin()[key];
+    return rule?.enabled ? rule : null;
+  }
+
+  function subscribeDebugLogs(listener) {
+    debugLogListeners.add(listener);
+    return () => {
+      debugLogListeners.delete(listener);
+    };
+  }
+
+  function notifyDebugLogListeners() {
+    debugLogListeners.forEach((listener) => {
+      try {
+        listener();
+      } catch (error) {
+        console.warn('[nbce] failed to notify debug listener', error);
+      }
+    });
+  }
+
+  function truncateDebugText(value, limit = DEBUG_TEXT_LIMIT) {
+    const text = `${value ?? ''}`;
+    if (text.length <= limit) {
+      return text;
+    }
+    return `${text.slice(0, limit)}\n... 已截断 ${text.length - limit} 个字符`;
+  }
+
+  function captureDebugResponseText(value) {
+    const text = `${value ?? ''}`;
+    if (text.length <= DEBUG_RESPONSE_TEXT_LIMIT) {
+      return { text, truncated: false };
+    }
+    return {
+      text: text.slice(0, DEBUG_RESPONSE_TEXT_LIMIT),
+      truncated: true,
+    };
+  }
+
+  function summarizeDebugBody(body) {
+    if (!isRecord(body) || body.kind === 'none') {
+      return '';
+    }
+    if (body.kind === 'text') {
+      return truncateDebugText(body.value);
+    }
+    if (body.kind === 'formData' && typeof body.value?.forEach === 'function') {
+      const entries = [];
+      body.value.forEach((value, key) => {
+        if (value instanceof Blob) {
+          entries.push(`${key}: [Blob ${value.size} bytes]`);
+          return;
+        }
+        entries.push(`${key}: ${truncateDebugText(value, 240)}`);
+      });
+      return truncateDebugText(entries.join('\n'));
+    }
+    if (body.kind === 'blob') {
+      return `[Blob ${Number(body.value?.size) || 0} bytes]`;
+    }
+    if (body.kind === 'arrayBuffer') {
+      return `[ArrayBuffer ${Number(body.value?.byteLength) || 0} bytes]`;
+    }
+    return truncateDebugText(body.value);
+  }
+
+  function extractDebugEndpoint(requestUrl, rule) {
+    let url;
+    try {
+      url = new URL(requestUrl, location.origin);
+    } catch (error) {
+      return '';
+    }
+
+    const candidatePrefixes = [];
+    [rule?.apiBaseUrl, rule?.sourceApiBaseUrl].forEach((value) => {
+      if (!value) {
+        return;
+      }
+      try {
+        const prefixUrl = new URL(value, rule?.targetOrigin || location.origin);
+        if (prefixUrl.origin === url.origin) {
+          candidatePrefixes.push(normalizePath(prefixUrl.pathname || '/api/'));
+        }
+      } catch (error) {
+        // Ignore malformed configured URLs.
+      }
+    });
+    candidatePrefixes.push('/api/');
+
+    for (const prefix of candidatePrefixes) {
+      const normalizedPrefix = normalizePath(prefix);
+      if (url.pathname === normalizedPrefix.slice(0, -1)) {
+        return '';
+      }
+      if (url.pathname.startsWith(normalizedPrefix)) {
+        return safeDecodeURIComponent(normalizeRelativePath(url.pathname.slice(normalizedPrefix.length)));
+      }
+    }
+
+    const segments = splitPathSegments(url.pathname);
+    const apiIndex = segments.findIndex((segment) => segment === 'api');
+    if (apiIndex >= 0) {
+      return safeDecodeURIComponent(normalizeRelativePath(segments.slice(apiIndex + 1).join('/')));
+    }
+    return safeDecodeURIComponent(normalizeRelativePath(url.pathname));
+  }
+
+  function addDebugLog(entry) {
+    const nextEntry = {
+      id: entry.id || `debug_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      at: entry.at || new Date().toISOString(),
+      method: `${entry.method || 'GET'}`.toUpperCase(),
+      endpoint: entry.endpoint || '',
+      url: entry.url || '',
+      originalUrl: entry.originalUrl || '',
+      status: Number(entry.status) || 0,
+      statusText: entry.statusText || '',
+      durationMs: Number(entry.durationMs) || 0,
+      requestBodySummary: entry.requestBodySummary || '',
+      responseText: entry.responseText || '',
+      responseTruncated: Boolean(entry.responseTruncated),
+      responseHeaders: entry.responseHeaders || '',
+      ok: entry.ok !== false,
+      overridden: Boolean(entry.overridden),
+      error: entry.error || '',
+    };
+    debugLogs.unshift(nextEntry);
+    if (debugLogs.length > DEBUG_LOG_LIMIT) {
+      debugLogs.length = DEBUG_LOG_LIMIT;
+    }
+    notifyDebugLogListeners();
+    return nextEntry;
   }
 
   function getPanelPosition() {
@@ -1626,6 +1860,7 @@
       const bridge = createBridgeRequest({
         method: request.method,
         url: plan.url,
+        originalUrl: plan.originalUrl || request.url,
         headers: headersToObject(request.headers),
         body: await extractFetchBody(request.clone()),
       });
@@ -1683,6 +1918,7 @@
         this._bridge = {
           method: 'GET',
           url: '',
+          originalUrl: '',
           headers: {},
           readyState: 0,
           status: 0,
@@ -1736,6 +1972,7 @@
         this._bridge.response = '';
         this._bridge.responseHeaders = '';
         this._bridge.responseURL = '';
+        this._bridge.originalUrl = '';
         this._bridge.pendingRequest = null;
       };
 
@@ -1823,6 +2060,7 @@
         this._resetBridgeState();
         this._bridge.method = method || 'GET';
         this._bridge.url = plan.url;
+        this._bridge.originalUrl = plan.originalUrl || requestUrl;
         this._bridge.timeout = Number(this._native.timeout) || this._bridge.timeout || 0;
         this._bridge.withCredentials = Boolean(this._native.withCredentials || this._bridge.withCredentials);
         this._bridge.responseType = this._native.responseType || this._bridge.responseType || '';
@@ -1844,6 +2082,7 @@
         const bridge = createBridgeRequest({
           method: this._bridge.method,
           url: this._bridge.url,
+          originalUrl: this._bridge.originalUrl,
           headers: headersToObject(this._bridge.headers),
           body: serializeXhrBody(body),
           timeout: this._bridge.timeout || 0,
@@ -2185,6 +2424,50 @@
 
     const activeRule = normalizeRule(rules[location.origin] || null) || currentRule;
     const payload = message.payload;
+    const method = `${payload.method || 'GET'}`.toUpperCase();
+    const endpoint = extractDebugEndpoint(payload.url, activeRule);
+    const startedAt = Date.now();
+    const requestBodySummary = summarizeDebugBody(payload.body);
+    const overrideRule = endpoint ? findDebugResponseOverride(method, endpoint) : null;
+
+    if (overrideRule) {
+      const responseHeaders =
+        overrideRule.responseHeaders || 'content-type: application/json\r\nx-nbce-debug: response-override\r\n';
+      const capturedResponse = captureDebugResponseText(overrideRule.responseText);
+      addDebugLog({
+        id: message.id,
+        method,
+        endpoint,
+        url: payload.url,
+        originalUrl: payload.originalUrl || '',
+        status: overrideRule.status,
+        statusText: overrideRule.statusText,
+        responseHeaders,
+        durationMs: Date.now() - startedAt,
+        requestBodySummary,
+        responseText: capturedResponse.text,
+        responseTruncated: capturedResponse.truncated,
+        ok: true,
+        overridden: true,
+      });
+      window.postMessage(
+        {
+          type: BRIDGE_REPLY_TYPE,
+          id: message.id,
+          ok: true,
+          response: {
+            status: overrideRule.status,
+            statusText: overrideRule.statusText,
+            responseHeaders,
+            finalUrl: payload.url,
+            bodyText: overrideRule.responseText,
+          },
+        },
+        location.origin,
+      );
+      return;
+    }
+
     const bodyKind = payload.body?.kind || 'none';
     const headers = {};
     Object.entries(isRecord(payload.headers) ? payload.headers : {}).forEach(([name, value]) => {
@@ -2231,13 +2514,24 @@
     let gmRequest;
     try {
       gmRequest = createGMRequest({
-        method: payload.method || 'GET',
+        method,
         url: payload.url,
         headers,
         data: requestData,
         timeout: typeof payload.timeout === 'number' ? payload.timeout : 0,
       });
     } catch (error) {
+      addDebugLog({
+        id: message.id,
+        method,
+        endpoint,
+        url: payload.url,
+        originalUrl: payload.originalUrl || '',
+        durationMs: Date.now() - startedAt,
+        requestBodySummary,
+        ok: false,
+        error: stringifyError(error),
+      });
       window.postMessage(
         {
           type: BRIDGE_REPLY_TYPE,
@@ -2258,6 +2552,31 @@
     gmRequest.promise.then(
       (response) => {
         pendingBridgeRequests.delete(message.id);
+        const bodyText = rewriteBridgeResponseText(
+          activeRule,
+          response.finalUrl || payload.url,
+          typeof response.responseText === 'string'
+            ? response.responseText
+            : typeof response.response === 'string'
+              ? response.response
+              : '',
+        );
+        const capturedResponse = captureDebugResponseText(bodyText);
+        addDebugLog({
+          id: message.id,
+          method,
+          endpoint,
+          url: response.finalUrl || payload.url,
+          originalUrl: payload.originalUrl || '',
+          status: response.status,
+          statusText: response.statusText || '',
+          responseHeaders: response.responseHeaders || '',
+          durationMs: Date.now() - startedAt,
+          requestBodySummary,
+          responseText: capturedResponse.text,
+          responseTruncated: capturedResponse.truncated,
+          ok: true,
+        });
         window.postMessage(
           {
             type: BRIDGE_REPLY_TYPE,
@@ -2268,15 +2587,7 @@
               statusText: response.statusText || '',
               responseHeaders: response.responseHeaders || '',
               finalUrl: response.finalUrl || payload.url,
-              bodyText: rewriteBridgeResponseText(
-                activeRule,
-                response.finalUrl || payload.url,
-                typeof response.responseText === 'string'
-                  ? response.responseText
-                  : typeof response.response === 'string'
-                    ? response.response
-                    : '',
-              ),
+              bodyText,
             },
           },
           location.origin,
@@ -2284,6 +2595,18 @@
       },
       (error) => {
         pendingBridgeRequests.delete(message.id);
+        addDebugLog({
+          id: message.id,
+          method,
+          endpoint,
+          url: payload.url,
+          originalUrl: payload.originalUrl || '',
+          status: error?.status || 0,
+          durationMs: Date.now() - startedAt,
+          requestBodySummary,
+          ok: false,
+          error: stringifyError(error),
+        });
         window.postMessage(
           {
             type: BRIDGE_REPLY_TYPE,
@@ -2336,6 +2659,10 @@
         : '未启用。填写 B 的完整入口 URL 后保存。',
       lastRule: currentRule,
       position: getPanelPosition(),
+      view: 'config',
+      selectedDebugLogId: '',
+      debugEditorValue: '',
+      debugStatus: '',
     };
 
     const style = document.createElement('style');
@@ -2396,7 +2723,7 @@
         pointer-events: none;
       }
       .nbce-card {
-        width: 360px;
+        width: min(560px, calc(100vw - 24px));
         margin-top: 10px;
         border-radius: 8px;
         border: 1px solid rgba(15, 23, 42, 0.14);
@@ -2428,6 +2755,34 @@
       }
       .nbce-body {
         padding: 14px 16px 16px;
+      }
+      .nbce-tabs {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 12px;
+        padding: 3px;
+        border-radius: 6px;
+        background: #f1f5f9;
+      }
+      .nbce-tab {
+        flex: 1;
+        appearance: none;
+        border: none;
+        border-radius: 5px;
+        padding: 7px 8px;
+        background: transparent;
+        color: #475569;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .nbce-tab.active {
+        background: #ffffff;
+        color: #0f172a;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+      }
+      .nbce-pane[hidden] {
+        display: none;
       }
       .nbce-field {
         margin-bottom: 12px;
@@ -2508,6 +2863,137 @@
         line-height: 1.55;
         color: #64748b;
       }
+      .nbce-debug-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .nbce-debug-grid {
+        display: grid;
+        grid-template-columns: 210px 1fr;
+        gap: 10px;
+        min-height: 320px;
+      }
+      .nbce-debug-list {
+        overflow: auto;
+        max-height: 430px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 6px;
+        background: #f8fafc;
+      }
+      .nbce-debug-empty {
+        padding: 16px;
+        color: #64748b;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .nbce-debug-item {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        border: none;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+        padding: 8px;
+        background: transparent;
+        cursor: pointer;
+        text-align: left;
+        color: #0f172a;
+      }
+      .nbce-debug-item:hover,
+      .nbce-debug-item.active {
+        background: #e0f2fe;
+      }
+      .nbce-debug-item-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .nbce-debug-item-endpoint {
+        margin-top: 4px;
+        font-size: 11px;
+        line-height: 1.35;
+        color: #334155;
+        word-break: break-all;
+      }
+      .nbce-badge {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 2px 6px;
+        background: #e2e8f0;
+        color: #334155;
+        font-size: 10px;
+        font-weight: 800;
+        line-height: 1.2;
+      }
+      .nbce-badge.ok {
+        background: #dcfce7;
+        color: #166534;
+      }
+      .nbce-badge.error {
+        background: #fee2e2;
+        color: #991b1b;
+      }
+      .nbce-badge.mock {
+        background: #fef3c7;
+        color: #92400e;
+      }
+      .nbce-debug-detail {
+        min-width: 0;
+      }
+      .nbce-debug-meta {
+        display: grid;
+        grid-template-columns: 88px 1fr;
+        gap: 6px 8px;
+        margin-bottom: 10px;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+      .nbce-debug-meta-label {
+        color: #64748b;
+        font-weight: 700;
+      }
+      .nbce-debug-meta-value {
+        min-width: 0;
+        color: #0f172a;
+        word-break: break-all;
+      }
+      .nbce-debug-textarea {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 210px;
+        resize: vertical;
+        border-radius: 6px;
+        border: 1px solid rgba(148, 163, 184, 0.42);
+        padding: 10px;
+        font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: #0f172a;
+        background: #ffffff;
+      }
+      .nbce-debug-textarea:focus {
+        outline: none;
+        border-color: rgba(14, 165, 233, 0.78);
+        box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.12);
+      }
+      .nbce-debug-status {
+        margin-top: 8px;
+        min-height: 17px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #475569;
+      }
+      @media (max-width: 560px) {
+        .nbce-debug-grid {
+          grid-template-columns: 1fr;
+        }
+        .nbce-debug-list {
+          max-height: 180px;
+        }
+      }
     `;
 
     shadow.appendChild(style);
@@ -2524,23 +3010,56 @@
           <div class="nbce-subtitle">让当前页面所在的 A 实例，将 API / 登录 / WS / 文件请求切到 B。</div>
         </div>
         <div class="nbce-body">
-          <div class="nbce-field">
-            <label class="nbce-label">当前 A 域名</label>
-            <div class="nbce-static">${escapeHtml(location.origin)}</div>
+          <div class="nbce-tabs">
+            <button class="nbce-tab active" data-view="config" type="button">配置</button>
+            <button class="nbce-tab" data-view="debug" type="button">请求调试</button>
           </div>
-          <div class="nbce-field">
-            <label class="nbce-label">B 的完整入口 URL</label>
-            <input class="nbce-input" type="url" placeholder="https://nocobase.example.com/apps/sandbox/admin" />
+          <div class="nbce-pane nbce-config-pane" data-pane="config">
+            <div class="nbce-field">
+              <label class="nbce-label">当前 A 域名</label>
+              <div class="nbce-static">${escapeHtml(location.origin)}</div>
+            </div>
+            <div class="nbce-field">
+              <label class="nbce-label">B 的完整入口 URL</label>
+              <input class="nbce-input" type="url" placeholder="https://nocobase.example.com/apps/sandbox/admin" />
+            </div>
+            <div class="nbce-actions">
+              <button class="nbce-button primary" data-action="save">保存并跳转</button>
+              <button class="nbce-button secondary" data-action="disable">停用</button>
+              <button class="nbce-button secondary" data-action="clear">清空登录态</button>
+              <button class="nbce-button secondary" data-action="diagnose">解析并诊断</button>
+            </div>
+            <div class="nbce-status"></div>
+            <div class="nbce-note">
+              说明：子应用 HTTP API 会保持目标实例真实 /api/ 路径，并通过 X-App 选择子应用；不会再请求 /api/__app/xxx/。
+            </div>
           </div>
-          <div class="nbce-actions">
-            <button class="nbce-button primary" data-action="save">保存并跳转</button>
-            <button class="nbce-button secondary" data-action="disable">停用</button>
-            <button class="nbce-button secondary" data-action="clear">清空登录态</button>
-            <button class="nbce-button secondary" data-action="diagnose">解析并诊断</button>
-          </div>
-          <div class="nbce-status"></div>
-          <div class="nbce-note">
-            说明：子应用 HTTP API 会保持目标实例真实 /api/ 路径，并通过 X-App 选择子应用；不会再请求 /api/__app/xxx/。
+          <div class="nbce-pane nbce-debug-pane" data-pane="debug" hidden>
+            <div class="nbce-debug-toolbar">
+              <button class="nbce-button secondary" data-action="debug-clear-logs">清空记录</button>
+              <button class="nbce-button secondary" data-action="debug-delete-override">删除当前改写</button>
+              <button class="nbce-button secondary" data-action="debug-clear-overrides">清空全部改写</button>
+            </div>
+            <div class="nbce-debug-grid">
+              <div class="nbce-debug-list"></div>
+              <div class="nbce-debug-detail">
+                <div class="nbce-debug-empty">暂无请求。触发一次被桥接的 NocoBase API 后会显示在这里。</div>
+                <div class="nbce-debug-selected" hidden>
+                  <div class="nbce-debug-meta"></div>
+                  <label class="nbce-label">响应 JSON</label>
+                  <textarea class="nbce-debug-textarea" spellcheck="false"></textarea>
+                  <div class="nbce-actions">
+                    <button class="nbce-button primary" data-action="debug-save-override">保存响应改写</button>
+                    <button class="nbce-button secondary" data-action="debug-copy-url">复制 URL</button>
+                    <button class="nbce-button secondary" data-action="debug-copy-response">复制响应</button>
+                  </div>
+                  <div class="nbce-debug-status"></div>
+                </div>
+              </div>
+            </div>
+            <div class="nbce-note">
+              响应改写仅保存在本机油猴存储里，命中后直接返回给前端，不会写入 B 后端。
+            </div>
           </div>
         </div>
       </div>
@@ -2553,6 +3072,14 @@
     const input = shadow.querySelector('.nbce-input');
     const status = shadow.querySelector('.nbce-status');
     const buttons = Array.from(shadow.querySelectorAll('.nbce-button'));
+    const tabs = Array.from(shadow.querySelectorAll('.nbce-tab'));
+    const panes = Array.from(shadow.querySelectorAll('.nbce-pane'));
+    const debugList = shadow.querySelector('.nbce-debug-list');
+    const debugEmpty = shadow.querySelector('.nbce-debug-empty');
+    const debugSelected = shadow.querySelector('.nbce-debug-selected');
+    const debugMeta = shadow.querySelector('.nbce-debug-meta');
+    const debugTextarea = shadow.querySelector('.nbce-debug-textarea');
+    const debugStatus = shadow.querySelector('.nbce-debug-status');
 
     input.value = state.targetUrl;
     status.textContent = state.status;
@@ -2622,13 +3149,154 @@
       shell.classList.add(`edge-${state.position.edge || 'right'}`);
     }
 
+    function getSelectedDebugLog() {
+      return debugLogs.find((log) => log.id === state.selectedDebugLogId) || null;
+    }
+
+    function formatDebugTime(value) {
+      try {
+        return new Date(value).toLocaleTimeString();
+      } catch (error) {
+        return '';
+      }
+    }
+
+    function getDebugRuleForLog(log) {
+      if (!log?.endpoint) {
+        return null;
+      }
+      return getDebugRulesForOrigin()[buildDebugRuleKey(log.method, log.endpoint)] || null;
+    }
+
+    function formatDebugJsonText(value) {
+      if (!value) {
+        return '';
+      }
+      try {
+        return JSON.stringify(JSON.parse(value), null, 2);
+      } catch (error) {
+        return value;
+      }
+    }
+
+    function setSelectedDebugLog(log) {
+      state.selectedDebugLogId = log?.id || '';
+      state.debugStatus = '';
+      if (!log) {
+        state.debugEditorValue = '';
+        return;
+      }
+      const rule = getDebugRuleForLog(log);
+      state.debugEditorValue = formatDebugJsonText(rule?.responseText || log.responseText || '');
+    }
+
+    function renderDebugList() {
+      if (!debugList) {
+        return;
+      }
+      if (!debugLogs.length) {
+        debugList.innerHTML = '<div class="nbce-debug-empty">暂无桥接请求。</div>';
+        return;
+      }
+      debugList.innerHTML = debugLogs
+        .map((log) => {
+          const selected = log.id === state.selectedDebugLogId ? ' active' : '';
+          const rule = getDebugRuleForLog(log);
+          const statusClass = log.ok ? 'ok' : 'error';
+          const statusText = log.ok ? log.status || '-' : 'ERR';
+          const badges = [
+            `<span class="nbce-badge ${statusClass}">${escapeHtml(statusText)}</span>`,
+            log.overridden || rule ? '<span class="nbce-badge mock">改写</span>' : '',
+          ]
+            .filter(Boolean)
+            .join('');
+          return `
+            <button class="nbce-debug-item${selected}" data-debug-id="${escapeHtml(log.id)}" type="button">
+              <div class="nbce-debug-item-head">
+                <span>${escapeHtml(log.method)} ${escapeHtml(formatDebugTime(log.at))}</span>
+                <span>${badges}</span>
+              </div>
+              <div class="nbce-debug-item-endpoint">${escapeHtml(log.endpoint || log.url || 'unknown')}</div>
+            </button>
+          `;
+        })
+        .join('');
+    }
+
+    function renderDebugDetail() {
+      if (!debugEmpty || !debugSelected || !debugMeta || !debugTextarea || !debugStatus) {
+        return;
+      }
+      const selectedLog = getSelectedDebugLog();
+      debugEmpty.hidden = Boolean(selectedLog);
+      debugSelected.hidden = !selectedLog;
+      if (!selectedLog) {
+        debugEmpty.textContent = debugLogs.length
+          ? '请选择左侧请求。'
+          : '暂无请求。触发一次被桥接的 NocoBase API 后会显示在这里。';
+        debugStatus.textContent = '';
+        return;
+      }
+
+      const rule = getDebugRuleForLog(selectedLog);
+      const metaRows = [
+        ['Endpoint', `${selectedLog.method} ${selectedLog.endpoint || '-'}`],
+        ['Status', selectedLog.ok ? `${selectedLog.status || 0} ${selectedLog.statusText || ''}`.trim() : '请求失败'],
+        ['Duration', `${selectedLog.durationMs} ms`],
+        ['Override', selectedLog.overridden ? '已命中本地改写' : rule ? '已有本地改写规则' : '无'],
+        ['URL', selectedLog.url],
+      ];
+      if (selectedLog.originalUrl && selectedLog.originalUrl !== selectedLog.url) {
+        metaRows.push(['Original', selectedLog.originalUrl]);
+      }
+      if (selectedLog.requestBodySummary) {
+        metaRows.push(['Body', selectedLog.requestBodySummary]);
+      }
+      if (selectedLog.error) {
+        metaRows.push(['Error', selectedLog.error]);
+      }
+      if (selectedLog.responseTruncated) {
+        metaRows.push(['Note', '响应内容过大，日志中只保留了前半部分。']);
+      }
+      debugMeta.innerHTML = metaRows
+        .map(
+          ([label, value]) => `
+            <div class="nbce-debug-meta-label">${escapeHtml(label)}</div>
+            <div class="nbce-debug-meta-value">${escapeHtml(value)}</div>
+          `,
+        )
+        .join('');
+      if (debugTextarea.value !== state.debugEditorValue) {
+        debugTextarea.value = state.debugEditorValue;
+      }
+      debugStatus.textContent = state.debugStatus;
+    }
+
+    function renderDebug() {
+      if (state.selectedDebugLogId && !getSelectedDebugLog()) {
+        setSelectedDebugLog(null);
+      }
+      if (!state.selectedDebugLogId && debugLogs.length) {
+        setSelectedDebugLog(debugLogs[0]);
+      }
+      renderDebugList();
+      renderDebugDetail();
+    }
+
     function render() {
       card.hidden = !state.expanded;
       input.value = state.targetUrl;
       status.textContent = state.status;
+      tabs.forEach((tab) => {
+        tab.classList.toggle('active', tab.getAttribute('data-view') === state.view);
+      });
+      panes.forEach((pane) => {
+        pane.hidden = pane.getAttribute('data-pane') !== state.view;
+      });
       buttons.forEach((button) => {
         button.disabled = state.saving;
       });
+      renderDebug();
       applyPanelPosition();
     }
 
@@ -2724,7 +3392,36 @@
       state.targetUrl = event.target.value.trim();
     });
 
+    debugTextarea?.addEventListener('input', (event) => {
+      state.debugEditorValue = event.target.value;
+    });
+
+    subscribeDebugLogs(() => {
+      render();
+    });
+
+    async function copyDebugText(value) {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('当前浏览器不支持剪贴板 API');
+      }
+      await navigator.clipboard.writeText(value || '');
+    }
+
     shadow.addEventListener('click', async (event) => {
+      const viewButton = event.target.closest('[data-view]');
+      if (viewButton) {
+        state.view = viewButton.getAttribute('data-view') || 'config';
+        render();
+        return;
+      }
+
+      const debugItem = event.target.closest('[data-debug-id]');
+      if (debugItem) {
+        setSelectedDebugLog(debugLogs.find((log) => log.id === debugItem.getAttribute('data-debug-id')) || null);
+        render();
+        return;
+      }
+
       const button = event.target.closest('[data-action]');
       if (!button || state.saving) {
         return;
@@ -2732,6 +3429,97 @@
 
       const action = button.getAttribute('data-action');
       if (!action) {
+        return;
+      }
+
+      if (action === 'debug-clear-logs') {
+        debugLogs.length = 0;
+        setSelectedDebugLog(null);
+        state.debugStatus = '已清空本页请求记录。';
+        render();
+        return;
+      }
+
+      if (action === 'debug-save-override') {
+        const selectedLog = getSelectedDebugLog();
+        if (!selectedLog) {
+          state.debugStatus = '请先选择一条请求。';
+          render();
+          return;
+        }
+        if (!selectedLog.endpoint) {
+          state.debugStatus = '当前请求无法识别 endpoint，不能保存改写规则。';
+          render();
+          return;
+        }
+        let parsedJson;
+        try {
+          parsedJson = JSON.parse(state.debugEditorValue || '');
+        } catch (error) {
+          state.debugStatus = `响应不是有效 JSON：${stringifyError(error)}`;
+          render();
+          return;
+        }
+        const responseText = JSON.stringify(parsedJson, null, 2);
+        try {
+          await saveDebugRuleForOrigin({
+            id: buildDebugRuleKey(selectedLog.method, selectedLog.endpoint),
+            key: buildDebugRuleKey(selectedLog.method, selectedLog.endpoint),
+            mode: 'responseOverride',
+            enabled: true,
+            method: selectedLog.method,
+            endpoint: selectedLog.endpoint,
+            responseText,
+            status: selectedLog.status || 200,
+            statusText: selectedLog.statusText || 'OK',
+            responseHeaders: 'content-type: application/json\r\nx-nbce-debug: response-override\r\n',
+            createdAt: getDebugRuleForLog(selectedLog)?.createdAt || new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+          state.debugEditorValue = responseText;
+          state.debugStatus = `已保存响应改写：${selectedLog.method} ${selectedLog.endpoint}`;
+          render();
+        } catch (error) {
+          state.debugStatus = `保存失败：${stringifyError(error)}`;
+          render();
+        }
+        return;
+      }
+
+      if (action === 'debug-delete-override') {
+        const selectedLog = getSelectedDebugLog();
+        if (!selectedLog?.endpoint) {
+          state.debugStatus = '请先选择一条可识别 endpoint 的请求。';
+          render();
+          return;
+        }
+        await deleteDebugRuleForOrigin(selectedLog.method, selectedLog.endpoint);
+        state.debugStatus = `已删除响应改写：${selectedLog.method} ${selectedLog.endpoint}`;
+        render();
+        return;
+      }
+
+      if (action === 'debug-clear-overrides') {
+        await clearDebugRulesForOrigin();
+        state.debugStatus = '已清空当前 A 域名下的全部响应改写规则。';
+        render();
+        return;
+      }
+
+      if (action === 'debug-copy-url' || action === 'debug-copy-response') {
+        const selectedLog = getSelectedDebugLog();
+        if (!selectedLog) {
+          state.debugStatus = '请先选择一条请求。';
+          render();
+          return;
+        }
+        try {
+          await copyDebugText(action === 'debug-copy-url' ? selectedLog.url : state.debugEditorValue);
+          state.debugStatus = action === 'debug-copy-url' ? '已复制 URL。' : '已复制响应内容。';
+        } catch (error) {
+          state.debugStatus = `复制失败：${stringifyError(error)}`;
+        }
+        render();
         return;
       }
 
