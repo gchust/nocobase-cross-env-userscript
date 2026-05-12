@@ -16,7 +16,7 @@ After installation, open any NocoBase page and use the floating **NB Cross Env**
 2. Open the **NB Cross Env** panel.
 3. Paste the full entry URL of instance B, for example:
 
-   `https://main.v2.test.nocobase.com/nocobase/apps/jhb20/admin/co6hibdf0iy`
+   `https://nocobase-b.example.com/nocobase/apps/sandbox/admin`
 
 4. Click **保存并跳转**.
 
