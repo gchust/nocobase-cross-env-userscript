@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NocoBase Cross Env
 // @namespace    https://nocobase.com/
-// @version      0.3.6
+// @version      0.3.7
 // @description  在 NocoBase 实例 A 上，将前端请求桥接到实例 B，并支持目标子应用。
 // @author       gchust
 // @homepageURL   https://github.com/gchust/nocobase-cross-env-userscript
@@ -29,10 +29,12 @@
   const BRIDGE_EVENT_TYPE = '__NBCE_USERSCRIPT_BRIDGE__';
   const BRIDGE_REPLY_TYPE = '__NBCE_USERSCRIPT_BRIDGE_REPLY__';
   const DEBUG_LOG_LIMIT = 80;
+  const RESOURCE_DIAGNOSTIC_LIMIT = 30;
   const DEBUG_TEXT_LIMIT = 2000;
   const DEBUG_RESPONSE_TEXT_LIMIT = 200000;
   const pendingBridgeRequests = new Map();
   const debugLogs = [];
+  const resourceDiagnostics = [];
   const debugLogListeners = new Set();
   let nbceDebugEnabled = loadDebugEnabled();
 
@@ -59,6 +61,8 @@
   }
 
   window.addEventListener('message', handleBridgeRequest, false);
+  window.addEventListener('error', handleResourceError, true);
+  window.addEventListener('unhandledrejection', handleUnhandledRejection, false);
   window.addEventListener('DOMContentLoaded', () => {
     if (isProbablyNocoBasePage() || currentRule?.enabled) {
       ensurePanel(false);
@@ -83,9 +87,23 @@
   }
 
   function loadDebugEnabled() {
+    if (isExplicitDebugEnabled()) {
+      return true;
+    }
     try {
       const storedValue = typeof GM_getValue === 'function' ? GM_getValue('nbce.debugEnabled.v1', false) : false;
       return storedValue === true || storedValue === 'true';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function isExplicitDebugEnabled() {
+    try {
+      return (
+        (typeof globalThis !== 'undefined' && (globalThis.NBCE_DEBUG === true || globalThis.NBCE_DEBUG === 'true')) ||
+        (typeof window !== 'undefined' && (window.NBCE_DEBUG === true || window.NBCE_DEBUG === 'true'))
+      );
     } catch (error) {
       return false;
     }
@@ -344,6 +362,7 @@
       ok: entry.ok !== false,
       overridden: Boolean(entry.overridden),
       error: entry.error || '',
+      diagnostics: Array.isArray(entry.diagnostics) ? entry.diagnostics : [],
     };
     debugLogs.unshift(nextEntry);
     if (debugLogs.length > DEBUG_LOG_LIMIT) {
@@ -351,6 +370,213 @@
     }
     notifyDebugLogListeners();
     return nextEntry;
+  }
+
+  function addResourceDiagnostic(entry) {
+    const nextEntry = {
+      id: entry.id || `resource_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      at: entry.at || new Date().toISOString(),
+      level: ['error', 'warn', 'info'].includes(entry.level) ? entry.level : 'warn',
+      kind: entry.kind || 'resource',
+      message: entry.message || '',
+      url: entry.url || '',
+      detail: entry.detail || '',
+      requestId: entry.requestId || '',
+    };
+    resourceDiagnostics.unshift(nextEntry);
+    if (resourceDiagnostics.length > RESOURCE_DIAGNOSTIC_LIMIT) {
+      resourceDiagnostics.length = RESOURCE_DIAGNOSTIC_LIMIT;
+    }
+    notifyDebugLogListeners();
+    return nextEntry;
+  }
+
+  function splitNocoBaseEndpoint(endpoint) {
+    const text = `${endpoint || ''}`.trim();
+    const separatorIndex = text.indexOf(':');
+    if (separatorIndex <= 0) {
+      return {
+        collection: '',
+        action: text,
+      };
+    }
+    return {
+      collection: text.slice(0, separatorIndex),
+      action: text.slice(separatorIndex + 1),
+    };
+  }
+
+  function stringifySemanticValue(value) {
+    if (typeof value === 'string') {
+      return `"${value}"`;
+    }
+    if (value == null) {
+      return String(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => stringifySemanticValue(item)).join(', ')}]`;
+    }
+    if (typeof value === 'object') {
+      return JSON.stringify(value);
+    }
+    return String(value);
+  }
+
+  function getFilterOperatorLabel(operator) {
+    return (
+      {
+        $eq: '=',
+        $ne: '!=',
+        $gt: '>',
+        $gte: '>=',
+        $lt: '<',
+        $lte: '<=',
+        $includes: 'includes',
+        $notIncludes: 'not includes',
+        $in: 'in',
+        $notIn: 'not in',
+        $isTruly: 'is true',
+        $isFalsy: 'is false',
+        $null: 'is null',
+        $notNull: 'is not null',
+        $empty: 'is empty',
+        $notEmpty: 'is not empty',
+        $dateOn: 'date on',
+        $dateNotOn: 'date not on',
+        $dateBefore: 'date before',
+        $dateAfter: 'date after',
+      }[operator] || operator
+    );
+  }
+
+  function formatSemanticFilterNode(value, depth = 0) {
+    const indent = '  '.repeat(depth);
+    if (Array.isArray(value)) {
+      return value.map((item) => formatSemanticFilterNode(item, depth)).filter(Boolean).join(`\n${indent}`);
+    }
+    if (!isRecord(value)) {
+      return `${indent}${stringifySemanticValue(value)}`;
+    }
+
+    const lines = [];
+    Object.entries(value).forEach(([key, childValue]) => {
+      if ((key === '$and' || key === '$or') && Array.isArray(childValue)) {
+        lines.push(`${indent}${key === '$and' ? 'AND' : 'OR'}`);
+        childValue.forEach((item) => {
+          const formatted = formatSemanticFilterNode(item, depth + 1);
+          if (formatted) {
+            lines.push(formatted);
+          }
+        });
+        return;
+      }
+
+      if (isRecord(childValue)) {
+        Object.entries(childValue).forEach(([operator, operand]) => {
+          if (operator.startsWith('$')) {
+            const label = getFilterOperatorLabel(operator);
+            if (['$isTruly', '$isFalsy', '$null', '$notNull', '$empty', '$notEmpty'].includes(operator)) {
+              lines.push(`${indent}${key} ${label}`);
+              return;
+            }
+            lines.push(`${indent}${key} ${label} ${stringifySemanticValue(operand)}`);
+            return;
+          }
+          lines.push(`${indent}${key}.${operator} = ${stringifySemanticValue(operand)}`);
+        });
+        return;
+      }
+
+      lines.push(`${indent}${key} = ${stringifySemanticValue(childValue)}`);
+    });
+    return lines.join('\n');
+  }
+
+  function parseJsonParam(params, name) {
+    const value = params.get(name);
+    if (!value) {
+      return null;
+    }
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function analyzeNocoBaseRequest(log) {
+    const endpointParts = splitNocoBaseEndpoint(log?.endpoint);
+    let url;
+    try {
+      url = new URL(log?.url || '', location.origin);
+    } catch (error) {
+      url = null;
+    }
+    const params = url?.searchParams || new URLSearchParams();
+    const filter = parseJsonParam(params, 'filter');
+    const sort = params.get('sort') || params.get('sorts') || '';
+    const fields = params.get('fields') || params.get('appends') || '';
+    const page = params.get('page') || '';
+    const pageSize = params.get('pageSize') || '';
+    const appName = params.get('__appName') || params.get('_app') || '';
+    const semanticLines = [];
+
+    if (endpointParts.collection) {
+      semanticLines.push(`collection: ${endpointParts.collection}`);
+    }
+    if (endpointParts.action) {
+      semanticLines.push(`action: ${endpointParts.action}`);
+    }
+    if (appName) {
+      semanticLines.push(`app: ${appName}`);
+    }
+    if (page || pageSize) {
+      semanticLines.push(`pagination: page ${page || '-'}, pageSize ${pageSize || '-'}`);
+    }
+    if (sort) {
+      semanticLines.push(`sort: ${sort}`);
+    }
+    if (fields) {
+      semanticLines.push(`fields: ${fields}`);
+    }
+    if (filter) {
+      semanticLines.push(`filter:\n${formatSemanticFilterNode(filter, 1)}`);
+    }
+
+    return {
+      ...endpointParts,
+      filter,
+      filterText: filter ? formatSemanticFilterNode(filter) : '',
+      summary: semanticLines.join('\n'),
+    };
+  }
+
+  function formatDebugQueryValue(value) {
+    const text = `${value ?? ''}`;
+    const trimmed = text.trim();
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        return JSON.stringify(JSON.parse(trimmed), null, 2);
+      } catch (error) {
+        return text;
+      }
+    }
+    return text;
+  }
+
+  function formatDebugQuery(value) {
+    let url;
+    try {
+      url = new URL(value, location.origin);
+    } catch (error) {
+      return '';
+    }
+    const rows = [];
+    url.searchParams.forEach((paramValue, paramName) => {
+      const formattedValue = formatDebugQueryValue(paramValue);
+      rows.push(`${paramName} =${formattedValue.includes('\n') ? `\n${formattedValue}` : ` ${formattedValue}`}`);
+    });
+    return rows.join('\n\n');
   }
 
   function getPanelPosition() {
@@ -922,6 +1148,224 @@
       return JSON.stringify(payload);
     } catch (error) {
       return responseText;
+    }
+  }
+
+  function extractAssetBase(url) {
+    const markers = ['/static/plugins/', '/static/', '/assets/'];
+    for (const marker of markers) {
+      const markerIndex = url.pathname.indexOf(marker);
+      if (markerIndex >= 0) {
+        const base = new URL(url.toString());
+        base.pathname = url.pathname.slice(0, markerIndex + 1);
+        base.search = '';
+        base.hash = '';
+        return normalizeAssetBaseUrl(base.toString());
+      }
+    }
+    return '';
+  }
+
+  function extractAssetVersion(url) {
+    const segments = splitPathSegments(url.pathname);
+    const staticIndex = segments.indexOf('static');
+    if (staticIndex > 0) {
+      return segments[staticIndex - 1];
+    }
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      if (/^\d+(?:\.\d+)+(?:[-+][a-z0-9][a-z0-9.-]*)?$/i.test(segments[index])) {
+        return segments[index];
+      }
+    }
+    return '';
+  }
+
+  function isNocoBaseJsAssetUrl(url) {
+    return (
+      /\/static\/plugins\//i.test(url.pathname) ||
+      /\/static\/.+\.js$/i.test(url.pathname) ||
+      /\/assets\/.+\.js$/i.test(url.pathname) ||
+      /\/[^/]+\.[a-f0-9]{6,}\.js$/i.test(url.pathname)
+    );
+  }
+
+  function diagnoseResourceUrl(value, rule, options = {}) {
+    const diagnostics = [];
+    if (!value) {
+      return diagnostics;
+    }
+
+    let url;
+    try {
+      url = new URL(value, options.baseUrl || location.href);
+    } catch (error) {
+      return [
+        {
+          level: 'warn',
+          kind: options.kind || 'resource',
+          message: '资源 URL 无法解析',
+          url: value,
+          detail: stringifyError(error),
+        },
+      ];
+    }
+
+    if (!isNocoBaseJsAssetUrl(url)) {
+      return diagnostics;
+    }
+
+    const expectedBase = normalizeAssetBaseUrl(rule?.sourceWebpackPublicPath || getCurrentSourceWebpackPublicPath());
+    const actualBase = extractAssetBase(url);
+    if (expectedBase && actualBase && actualBase !== expectedBase) {
+      diagnostics.push({
+        level: 'warn',
+        kind: options.kind || 'resource',
+        message: '资源基准路径和当前前端不一致',
+        url: url.toString(),
+        detail: `actual: ${actualBase}\nexpected: ${expectedBase}`,
+      });
+    }
+
+    if (/^cdn\.nocobase\.com$/i.test(url.hostname) && url.origin !== location.origin) {
+      diagnostics.push({
+        level: 'warn',
+        kind: options.kind || 'resource',
+        message: '资源指向 NocoBase CDN，可能和当前测试环境版本不一致',
+        url: url.toString(),
+        detail: options.detail || '',
+      });
+    }
+
+    if (expectedBase) {
+      try {
+        const expectedVersion = extractAssetVersion(new URL(expectedBase));
+        const actualVersion = extractAssetVersion(url);
+        if (expectedVersion && actualVersion && expectedVersion !== actualVersion) {
+          diagnostics.push({
+            level: 'warn',
+            kind: options.kind || 'resource',
+            message: '资源版本号和当前前端资源版本不一致',
+            url: url.toString(),
+            detail: `actual: ${actualVersion}\nexpected: ${expectedVersion}`,
+          });
+        }
+      } catch (error) {
+        // Version comparison is best-effort only.
+      }
+    }
+
+    return diagnostics;
+  }
+
+  function normalizeDiagnosticResourceUrl(value) {
+    try {
+      return new URL(value, location.href).toString();
+    } catch (error) {
+      return `${value || ''}`;
+    }
+  }
+
+  function diagnoseResourceLoadFailure(value, rule, detail) {
+    const diagnostics = diagnoseResourceUrl(value, rule, {
+      kind: 'resource',
+      detail,
+    });
+
+    if (diagnostics.length) {
+      return diagnostics.map((diagnostic) => ({
+        ...diagnostic,
+        level: 'error',
+        message: `资源加载失败：${diagnostic.message}`,
+        detail: diagnostic.detail || detail || '',
+      }));
+    }
+
+    return [
+      {
+        level: 'error',
+        kind: 'resource',
+        message: '资源加载失败',
+        url: normalizeDiagnosticResourceUrl(value),
+        detail: detail || '',
+      },
+    ];
+  }
+
+  function diagnosePmListEnabledResponse(rule, requestUrl, responseText) {
+    let resolvedRequestUrl;
+    try {
+      resolvedRequestUrl = new URL(requestUrl, location.origin);
+    } catch (error) {
+      return [];
+    }
+    if (!resolvedRequestUrl.pathname.endsWith('/pm:listEnabled')) {
+      return [];
+    }
+
+    try {
+      const payload = JSON.parse(responseText || '');
+      if (!Array.isArray(payload?.data)) {
+        return [
+          {
+            level: 'warn',
+            kind: 'plugin',
+            message: 'pm:listEnabled 响应不是预期的插件列表结构',
+            url: requestUrl,
+            detail: '',
+          },
+        ];
+      }
+      return payload.data.flatMap((item) => {
+        const url = typeof item?.url === 'string' ? item.url : '';
+        return diagnoseResourceUrl(url, rule, {
+          kind: 'plugin',
+          detail: item?.packageName || item?.name || '',
+          baseUrl: resolvedRequestUrl.origin,
+        });
+      });
+    } catch (error) {
+      return [
+        {
+          level: 'warn',
+          kind: 'plugin',
+          message: 'pm:listEnabled 响应无法解析为 JSON',
+          url: requestUrl,
+          detail: stringifyError(error),
+        },
+      ];
+    }
+  }
+
+  function diagnoseBridgeResponse(rule, endpoint, requestUrl, responseText) {
+    const diagnostics = [];
+    const endpointText = `${endpoint || ''}`;
+    if (endpointText === 'pm:listEnabled' || endpointText.endsWith('/pm:listEnabled')) {
+      diagnostics.push(...diagnosePmListEnabledResponse(rule, requestUrl, responseText));
+    }
+    return diagnostics;
+  }
+
+  function prepareBridgeResponseText(rule, endpoint, requestUrl, rawResponseText) {
+    const diagnostics = diagnoseBridgeResponse(rule, endpoint, requestUrl, rawResponseText);
+    const bodyText = rewriteBridgeResponseText(rule, requestUrl, rawResponseText);
+    return {
+      bodyText,
+      diagnostics,
+    };
+  }
+
+  function selectRecentResourceIssues(issues, selectedLog, limit = 5) {
+    const selectedRequestId = selectedLog?.id || '';
+    return (Array.isArray(issues) ? issues : [])
+      .filter((issue) => !selectedRequestId || issue.requestId !== selectedRequestId)
+      .slice(0, limit);
+  }
+
+  function clearDebugRecords(logs = debugLogs, issues = resourceDiagnostics) {
+    logs.length = 0;
+    issues.length = 0;
+    if (logs === debugLogs && issues === resourceDiagnostics) {
+      notifyDebugLogListeners();
     }
   }
 
@@ -2427,6 +2871,100 @@
     return '';
   }
 
+  function getActiveRuleForDiagnostics() {
+    const activeRule = normalizeRule(rules[location.origin] || null) || currentRule;
+    return activeRule?.enabled ? activeRule : null;
+  }
+
+  function shouldRunResourceDiagnosticsForState(hasEnabledRule, isLikelyNocoBasePageValue) {
+    return Boolean(hasEnabledRule || isLikelyNocoBasePageValue);
+  }
+
+  function shouldRunResourceDiagnostics() {
+    return shouldRunResourceDiagnosticsForState(Boolean(getActiveRuleForDiagnostics()), isProbablyNocoBasePage());
+  }
+
+  function extractUrlFromChunkErrorMessage(message) {
+    const match = `${message || ''}`.match(/https?:\/\/[^\s'")]+/i);
+    return match ? match[0].replace(/[.,;]+$/g, '') : '';
+  }
+
+  function addChunkResourceDiagnostics(message, url, fallbackMessage) {
+    const activeRule = getActiveRuleForDiagnostics();
+    const diagnostics = url
+      ? diagnoseResourceUrl(url, activeRule, {
+          kind: 'chunk',
+          detail: message,
+        })
+      : [];
+
+    if (diagnostics.length) {
+      diagnostics.forEach((diagnostic) =>
+        addResourceDiagnostic({
+          ...diagnostic,
+          level: 'error',
+          kind: 'chunk',
+          message: `${fallbackMessage}：${diagnostic.message}`,
+          detail: diagnostic.detail || message,
+        }),
+      );
+      return;
+    }
+
+    addResourceDiagnostic({
+      level: 'error',
+      kind: 'chunk',
+      message: fallbackMessage,
+      url,
+      detail: message,
+    });
+  }
+
+  function handleResourceError(event) {
+    if (!shouldRunResourceDiagnostics()) {
+      return;
+    }
+
+    const target = event?.target;
+    if (target && target !== window && target instanceof Element) {
+      const url = target.getAttribute('src') || target.getAttribute('href') || '';
+      if (!url) {
+        return;
+      }
+      const activeRule = getActiveRuleForDiagnostics();
+      const diagnostics = diagnoseResourceLoadFailure(url, activeRule, target.tagName.toLowerCase());
+      diagnostics.forEach((diagnostic) => addResourceDiagnostic(diagnostic));
+      return;
+    }
+
+    const message = `${event?.message || ''}`;
+    if (!/Loading chunk|ChunkLoadError|failed to fetch dynamically imported module/i.test(message)) {
+      return;
+    }
+    addChunkResourceDiagnostics(
+      message,
+      extractUrlFromChunkErrorMessage(message) || event?.filename || '',
+      '检测到 chunk 加载失败',
+    );
+  }
+
+  function handleUnhandledRejection(event) {
+    if (!shouldRunResourceDiagnostics()) {
+      return;
+    }
+
+    const reason = event?.reason;
+    const message = `${reason?.message || reason || ''}`;
+    if (!/Loading chunk|ChunkLoadError|failed to fetch dynamically imported module/i.test(message)) {
+      return;
+    }
+    addChunkResourceDiagnostics(
+      message,
+      extractUrlFromChunkErrorMessage(message) || reason?.request || '',
+      '检测到异步 chunk 加载失败',
+    );
+  }
+
   function handleBridgeRequest() {
     const event = arguments[0];
     if (!event || event.origin !== location.origin) {
@@ -2610,21 +3148,28 @@
           durationMs: Date.now() - startedAt,
           finalUrl: response.finalUrl || payload.url,
         });
-        const bodyText = rewriteBridgeResponseText(
-          activeRule,
-          response.finalUrl || payload.url,
+        const finalUrl = response.finalUrl || payload.url;
+        const rawResponseText =
           typeof response.responseText === 'string'
             ? response.responseText
             : typeof response.response === 'string'
               ? response.response
-              : '',
-        );
+              : '';
+        const { bodyText, diagnostics } = prepareBridgeResponseText(activeRule, endpoint, finalUrl, rawResponseText);
         const capturedResponse = captureDebugResponseText(bodyText);
+        diagnostics
+          .filter((diagnostic) => diagnostic.level !== 'info')
+          .forEach((diagnostic) =>
+            addResourceDiagnostic({
+              ...diagnostic,
+              requestId: message.id,
+            }),
+          );
         addDebugLog({
           id: message.id,
           method,
           endpoint,
-          url: response.finalUrl || payload.url,
+          url: finalUrl,
           originalUrl: payload.originalUrl || '',
           status: response.status,
           statusText: response.statusText || '',
@@ -2634,6 +3179,7 @@
           responseText: capturedResponse.text,
           responseTruncated: capturedResponse.truncated,
           ok: true,
+          diagnostics,
         });
         window.postMessage(
           {
@@ -2644,7 +3190,7 @@
               status: response.status,
               statusText: response.statusText || '',
               responseHeaders: response.responseHeaders || '',
-              finalUrl: response.finalUrl || payload.url,
+              finalUrl,
               bodyText,
             },
           },
@@ -3258,32 +3804,23 @@
       }
     }
 
-    function formatDebugQueryValue(value) {
-      const text = `${value ?? ''}`;
-      const trimmed = text.trim();
-      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-        try {
-          return JSON.stringify(JSON.parse(trimmed), null, 2);
-        } catch (error) {
-          return text;
-        }
+    function formatDiagnostics(diagnostics) {
+      if (!diagnostics.length) {
+        return '未发现明显风险';
       }
-      return text;
-    }
-
-    function formatDebugQuery(value) {
-      let url;
-      try {
-        url = new URL(value, location.origin);
-      } catch (error) {
-        return '';
-      }
-      const rows = [];
-      url.searchParams.forEach((paramValue, paramName) => {
-        const formattedValue = formatDebugQueryValue(paramValue);
-        rows.push(`${paramName} =${formattedValue.includes('\n') ? `\n${formattedValue}` : ` ${formattedValue}`}`);
-      });
-      return rows.join('\n\n');
+      return diagnostics
+        .slice(0, 8)
+        .map((diagnostic) => {
+          const prefix = diagnostic.level === 'error' ? 'ERROR' : diagnostic.level === 'warn' ? 'WARN' : 'INFO';
+          return [
+            `[${prefix}] ${diagnostic.message}`,
+            diagnostic.url ? `URL: ${diagnostic.url}` : '',
+            diagnostic.detail ? `Detail: ${diagnostic.detail}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n');
+        })
+        .join('\n\n');
     }
 
     function setSelectedDebugLog(log) {
@@ -3347,13 +3884,21 @@
 
       const rule = getDebugRuleForLog(selectedLog);
       const queryText = formatDebugQuery(selectedLog.url);
+      const semantic = analyzeNocoBaseRequest(selectedLog);
+      const requestDiagnostics = selectedLog.diagnostics || [];
+      const recentResourceIssues = selectRecentResourceIssues(resourceDiagnostics, selectedLog);
       const metaRows = [
         ['Endpoint', `${selectedLog.method} ${selectedLog.endpoint || '-'}`],
+        ['Semantic', semantic.summary || '未识别到 NocoBase collection/action 语义'],
         ['Status', selectedLog.ok ? `${selectedLog.status || 0} ${selectedLog.statusText || ''}`.trim() : '请求失败'],
         ['Duration', `${selectedLog.durationMs} ms`],
         ['Override', selectedLog.overridden ? '已命中本地改写' : rule ? '已有本地改写规则' : '无'],
+        ['Diagnostics', formatDiagnostics(requestDiagnostics)],
         ['URL', formatDebugUrlPath(selectedLog.url)],
       ];
+      if (recentResourceIssues.length) {
+        metaRows.push(['Recent Resource Issues', formatDiagnostics(recentResourceIssues)]);
+      }
       if (queryText) {
         metaRows.push(['Query', queryText]);
       }
@@ -3552,7 +4097,7 @@
       }
 
       if (action === 'debug-clear-logs') {
-        debugLogs.length = 0;
+        clearDebugRecords();
         setSelectedDebugLog(null);
         state.debugStatus = '已清空本页请求记录。';
         render();
@@ -3788,6 +4333,26 @@
     });
 
     render();
+  }
+
+  if (typeof globalThis !== 'undefined' && globalThis.__NBCE_EXPOSE_INTERNALS_FOR_TEST__) {
+    globalThis.__NBCE_TEST_INTERNALS__ = {
+      splitNocoBaseEndpoint,
+      formatSemanticFilterNode,
+      formatDebugQuery,
+      extractUrlFromChunkErrorMessage,
+      shouldRunResourceDiagnosticsForState,
+      diagnoseBridgeResponse,
+      diagnoseResourceUrl,
+      diagnoseResourceLoadFailure,
+      prepareBridgeResponseText,
+      rewriteBridgeResponseText,
+      selectRecentResourceIssues,
+      clearDebugRecords,
+      get nbceDebugEnabled() {
+        return nbceDebugEnabled;
+      },
+    };
   }
 })();
 //# sourceURL=nbce-userscript.js

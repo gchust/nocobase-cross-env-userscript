@@ -1,19 +1,24 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const rootDir = resolve(import.meta.dirname, '..');
 const sourceFile = resolve(rootDir, 'nocobase-cross-env.user.js');
 const host = process.env.NBCE_DEV_HOST || '127.0.0.1';
 const port = Number(process.env.NBCE_DEV_PORT || 5173);
 
-function withoutUserscriptHeader(source) {
+export function withoutUserscriptHeader(source) {
   return source.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\n?/, '');
 }
 
-function withDevSourceHints(source) {
+function withoutProductionSourceHint(source) {
+  return source.replace(/\n?\/\/# sourceURL=nbce-userscript\.js\s*$/g, '');
+}
+
+export function withDevSourceHints(source) {
   return [
-    withoutUserscriptHeader(source),
+    withoutProductionSourceHint(withoutUserscriptHeader(source)),
     '',
     '//# sourceURL=nbce-userscript-dev.js',
     '//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbIm5iY2UtdXNlcnNjcmlwdC1kZXYuanMiXSwibWFwcGluZ3MiOiIifQ==',
@@ -49,7 +54,9 @@ const server = createServer(async (request, response) => {
   response.end('Not found');
 });
 
-server.listen(port, host, () => {
-  console.log(`[nbce-dev] serving http://${host}:${port}/nocobase-cross-env.dev.js`);
-  console.log('[nbce-dev] install dev/nocobase-cross-env.dev.user.js in Tampermonkey, then disable the production script.');
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(port, host, () => {
+    console.log(`[nbce-dev] serving http://${host}:${port}/nocobase-cross-env.dev.js`);
+    console.log('[nbce-dev] install dev/nocobase-cross-env.dev.user.js in Tampermonkey, then disable the production script.');
+  });
+}

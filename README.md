@@ -50,9 +50,10 @@ Disable the production `NocoBase Cross Env` script while using `NocoBase Cross E
 
 ### Debugging
 
-- Open the page DevTools and look for `nbce-userscript-dev.js`, `nbce-userscript.js`, and `nbce-page-bootstrap.js` in Sources.
+- Open the page DevTools and look for `nbce-userscript-dev.js` and `nbce-page-bootstrap.js` in Sources.
 - Use the in-page **请求调试** tab first. Tampermonkey `GM_xmlhttpRequest` traffic is not reliably visible in the page Network panel.
 - Enable detailed bridge logs from the Tampermonkey menu command **NocoBase Cross Env: 切换调试日志** or the **请求调试** tab button. Logs are persisted locally and can be turned off the same way.
+- For one-off local debugging, setting `globalThis.NBCE_DEBUG = true` before the script initializes enables the same detailed logs without changing backend data.
 - The local dev server sends `Cache-Control: no-store`; refresh the target page after editing the script.
 - If you are debugging `document-start` timing issues, install the production bundle directly instead of the DEV loader, because `@require` from localhost can change timing.
 
