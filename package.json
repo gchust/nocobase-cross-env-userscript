@@ -1,0 +1,12 @@
+{
+  "name": "nocobase-cross-env-userscript",
+  "version": "0.3.6",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev-server.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "node --test"
+  },
+  "devDependencies": {}
+}

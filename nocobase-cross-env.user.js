@@ -34,6 +34,7 @@
   const pendingBridgeRequests = new Map();
   const debugLogs = [];
   const debugLogListeners = new Set();
+  let nbceDebugEnabled = loadDebugEnabled();
 
   const rules = loadRules();
   const currentRule = normalizeRule(rules[location.origin] || null);
@@ -50,6 +51,10 @@
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('NocoBase Cross Env: 打开面板', () => {
       ensurePanel(true);
+    });
+    GM_registerMenuCommand('NocoBase Cross Env: 切换调试日志', () => {
+      setDebugEnabled(!nbceDebugEnabled);
+      console.info(`[nbce] debug logs ${nbceDebugEnabled ? 'enabled' : 'disabled'}`);
     });
   }
 
@@ -75,6 +80,30 @@
       return Promise.resolve(GM_setValue(STORAGE_KEY, nextRules));
     }
     return Promise.resolve();
+  }
+
+  function loadDebugEnabled() {
+    try {
+      const storedValue = typeof GM_getValue === 'function' ? GM_getValue('nbce.debugEnabled.v1', false) : false;
+      return storedValue === true || storedValue === 'true';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function setDebugEnabled(enabled) {
+    nbceDebugEnabled = Boolean(enabled);
+    if (typeof GM_setValue === 'function') {
+      void Promise.resolve(GM_setValue('nbce.debugEnabled.v1', nbceDebugEnabled));
+    }
+    notifyDebugLogListeners();
+  }
+
+  function debugLog() {
+    if (!nbceDebugEnabled) {
+      return;
+    }
+    console.debug('[nbce]', ...arguments);
   }
 
   function loadPanelPositions() {
@@ -1250,7 +1279,8 @@
     script.textContent = `;(${pageBootstrap.toString()})(${JSON.stringify(rule)}, ${JSON.stringify({
       bridgeEventType: BRIDGE_EVENT_TYPE,
       bridgeReplyType: BRIDGE_REPLY_TYPE,
-    })});`;
+    })});
+//# sourceURL=nbce-page-bootstrap.js`;
     const parent = document.head || document.documentElement || document.body;
     if (!parent) {
       document.addEventListener(
@@ -2429,8 +2459,22 @@
     const startedAt = Date.now();
     const requestBodySummary = summarizeDebugBody(payload.body);
     const overrideRule = endpoint ? findDebugResponseOverride(method, endpoint) : null;
+    debugLog('bridge request', {
+      id: message.id,
+      method,
+      endpoint,
+      url: payload.url,
+      originalUrl: payload.originalUrl || '',
+      bodyKind: payload.body?.kind || 'none',
+    });
 
     if (overrideRule) {
+      debugLog('bridge override hit', {
+        id: message.id,
+        method,
+        endpoint,
+        status: overrideRule.status,
+      });
       const responseHeaders =
         overrideRule.responseHeaders || 'content-type: application/json\r\nx-nbce-debug: response-override\r\n';
       const capturedResponse = captureDebugResponseText(overrideRule.responseText);
@@ -2521,6 +2565,12 @@
         timeout: typeof payload.timeout === 'number' ? payload.timeout : 0,
       });
     } catch (error) {
+      debugLog('bridge request setup failed', {
+        id: message.id,
+        method,
+        endpoint,
+        error: stringifyError(error),
+      });
       addDebugLog({
         id: message.id,
         method,
@@ -2552,6 +2602,14 @@
     gmRequest.promise.then(
       (response) => {
         pendingBridgeRequests.delete(message.id);
+        debugLog('bridge response', {
+          id: message.id,
+          method,
+          endpoint,
+          status: response.status,
+          durationMs: Date.now() - startedAt,
+          finalUrl: response.finalUrl || payload.url,
+        });
         const bodyText = rewriteBridgeResponseText(
           activeRule,
           response.finalUrl || payload.url,
@@ -2595,6 +2653,14 @@
       },
       (error) => {
         pendingBridgeRequests.delete(message.id);
+        debugLog('bridge error', {
+          id: message.id,
+          method,
+          endpoint,
+          status: error?.status || 0,
+          durationMs: Date.now() - startedAt,
+          error: stringifyError(error),
+        });
         addDebugLog({
           id: message.id,
           method,
@@ -2663,6 +2729,7 @@
       selectedDebugLogId: '',
       debugEditorValue: '',
       debugStatus: '',
+      debugEnabled: nbceDebugEnabled,
     };
 
     const style = document.createElement('style');
@@ -3038,6 +3105,7 @@
           <div class="nbce-pane nbce-debug-pane" data-pane="debug" hidden>
             <div class="nbce-debug-toolbar">
               <button class="nbce-button secondary" data-action="debug-clear-logs">清空记录</button>
+              <button class="nbce-button secondary" data-action="debug-toggle-logs">开启详细日志</button>
               <button class="nbce-button secondary" data-action="debug-delete-override">删除当前改写</button>
               <button class="nbce-button secondary" data-action="debug-clear-overrides">清空全部改写</button>
             </div>
@@ -3081,6 +3149,7 @@
     const debugMeta = shadow.querySelector('.nbce-debug-meta');
     const debugTextarea = shadow.querySelector('.nbce-debug-textarea');
     const debugStatus = shadow.querySelector('.nbce-debug-status');
+    const debugToggleButton = shadow.querySelector('[data-action="debug-toggle-logs"]');
 
     input.value = state.targetUrl;
     status.textContent = state.status;
@@ -3212,7 +3281,7 @@
       const rows = [];
       url.searchParams.forEach((paramValue, paramName) => {
         const formattedValue = formatDebugQueryValue(paramValue);
-        rows.push(`${paramName} = ${formattedValue.includes('\n') ? `\n${formattedValue}` : formattedValue}`);
+        rows.push(`${paramName} =${formattedValue.includes('\n') ? `\n${formattedValue}` : ` ${formattedValue}`}`);
       });
       return rows.join('\n\n');
     }
@@ -3319,6 +3388,10 @@
     }
 
     function renderDebug() {
+      state.debugEnabled = nbceDebugEnabled;
+      if (debugToggleButton) {
+        debugToggleButton.textContent = state.debugEnabled ? '关闭详细日志' : '开启详细日志';
+      }
       if (state.selectedDebugLogId && !getSelectedDebugLog()) {
         setSelectedDebugLog(null);
       }
@@ -3482,6 +3555,15 @@
         debugLogs.length = 0;
         setSelectedDebugLog(null);
         state.debugStatus = '已清空本页请求记录。';
+        render();
+        return;
+      }
+
+      if (action === 'debug-toggle-logs') {
+        setDebugEnabled(!nbceDebugEnabled);
+        state.debugStatus = nbceDebugEnabled
+          ? '已开启详细 console 日志。'
+          : '已关闭详细 console 日志。';
         render();
         return;
       }
@@ -3708,3 +3790,4 @@
     render();
   }
 })();
+//# sourceURL=nbce-userscript.js
