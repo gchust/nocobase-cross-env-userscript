@@ -3337,7 +3337,10 @@
       }
       .nbce-card {
         width: min(560px, calc(100vw - 24px));
+        max-height: calc(100vh - 64px);
         margin-top: 10px;
+        display: flex;
+        flex-direction: column;
         border-radius: 8px;
         border: 1px solid rgba(15, 23, 42, 0.14);
         background: rgba(255, 255, 255, 0.98);
@@ -3367,6 +3370,8 @@
         color: #475569;
       }
       .nbce-body {
+        min-height: 0;
+        overflow: auto;
         padding: 14px 16px 16px;
       }
       .nbce-tabs {
