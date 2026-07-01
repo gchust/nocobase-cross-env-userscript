@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NocoBase Cross Env
 // @namespace    https://nocobase.com/
-// @version      0.3.7
+// @version      0.3.8
 // @description  在 NocoBase 实例 A 上，将前端请求桥接到实例 B，并支持目标子应用。
 // @author       gchust
 // @homepageURL   https://github.com/gchust/nocobase-cross-env-userscript
