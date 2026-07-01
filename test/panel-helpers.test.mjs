@@ -268,3 +268,40 @@ test('panel status summary reports mapping, debug state, counts, and non-NocoBas
   );
   assert.deepEqual([...disabled.badgeItems.map((item) => item.text)], ['No rule', 'No debug', 'Non-NB']);
 });
+
+test('client v2 /v/ routes keep mirror paths while API and storage use root public path', async () => {
+  const internals = await loadUserscriptInternals({
+    locationHref: 'https://main.v2.test.nocobase.com/nocobase/v/apps/jhb20/admin',
+  });
+
+  const route = internals.extractNocoBaseAppRoute('/nocobase/v/apps/jhb20/admin/zd31');
+  assert.equal(route.usesClientV2, true);
+  assert.equal(route.clientPrefix, 'v');
+  assert.equal(route.rootPublicPath, '/nocobase/');
+  assert.equal(route.restPath, 'admin/zd31');
+
+  assert.equal(internals.toRootPublicPath('/nocobase/v/'), '/nocobase/');
+  assert.equal(internals.derivePublicPathFromUrl('https://target.example.com/nocobase/v/apps/jhb20/admin'), '/nocobase/v/');
+  assert.equal(internals.getCurrentSourcePublicPath(), '/nocobase/v/');
+  assert.equal(internals.getCurrentSourceRootPublicPath(), '/nocobase/');
+
+  const rule = {
+    targetAppName: 'jhb20',
+    sourceRootPublicPath: '/nocobase/',
+    targetEntryUrl: 'https://target.example.com/nocobase/v/apps/jhb20/admin/zd31',
+    targetAppEntryPath: 'admin/zd31',
+  };
+
+  assert.equal(
+    internals.buildTargetAppPathForPathname(rule, '/nocobase/v/apps/jhb20/admin/tasks'),
+    '/nocobase/v/admin/tasks',
+  );
+  assert.equal(
+    internals.buildDefaultSubAppAdminPath(rule, '/nocobase/v/apps/jhb20/signin'),
+    '/nocobase/v/admin/',
+  );
+  assert.equal(
+    new URL(internals.buildLocalEntryHref(rule)).pathname,
+    '/nocobase/v/admin/zd31',
+  );
+});

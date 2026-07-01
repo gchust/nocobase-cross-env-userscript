@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { loadUserscriptWithDom } from '../test-support/userscript-internals.mjs';
 
 const RULES_KEY = 'nbce.rules.v1';
@@ -193,4 +194,63 @@ test('shadow panel supports target history, resource-only mode, copy fallback, a
 
   shadow.querySelector('#nbce-panel-toggle').click();
   assert.equal(shadow.querySelector('.nbce-toggle-badges'), null);
+});
+
+test('page bootstrap bridges client v2 /v/ API paths to the root target API path', async () => {
+  let bootstrapSource = '';
+  const gmRequests = [];
+  const { context } = await loadUserscriptWithDom({
+    locationHref: `${ORIGIN}/nocobase/v/admin`,
+    GM_values: {
+      [RULES_KEY]: {
+        [ORIGIN]: {
+          ...ruleFor(ORIGIN),
+          targetEntryUrl: 'https://target.example.com/nocobase/v/apps/jhb20/admin',
+          targetAppName: 'jhb20',
+          targetPublicPath: '/nocobase/v/',
+          targetRootPublicPath: '/nocobase/',
+          apiBaseUrl: 'https://target.example.com/nocobase/api/',
+          storagePath: '/nocobase/storage/uploads/',
+        },
+      },
+    },
+    onScriptAppended(node) {
+      if ((node.textContent || '').includes('nbce-page-bootstrap.js')) {
+        bootstrapSource = node.textContent;
+      }
+    },
+    GM_xmlhttpRequest(request) {
+      gmRequests.push(request);
+      queueMicrotask(() => {
+        request.onload?.({
+          status: 200,
+          statusText: 'OK',
+          responseHeaders: 'content-type: application/json\r\n',
+          responseText: '{"ok":true}',
+          finalUrl: request.url,
+        });
+      });
+      return {
+        abort() {},
+      };
+    },
+  });
+
+  assert.ok(bootstrapSource, 'expected userscript to inject the page bootstrap for an enabled rule');
+  Object.assign(context, {
+    Request,
+    Response,
+    Headers,
+    AbortController,
+  });
+  context.window.fetch = () => Promise.reject(new Error('request should have been bridged'));
+  vm.runInNewContext(bootstrapSource, context, {
+    filename: 'nbce-page-bootstrap.js',
+  });
+
+  const response = await context.window.fetch(`${ORIGIN}/nocobase/v/api/users:list?keyword=ada`);
+  assert.equal(await response.text(), '{"ok":true}');
+  assert.equal(gmRequests.length, 1);
+  assert.equal(gmRequests[0].url, 'https://target.example.com/nocobase/api/users:list?keyword=ada');
+  assert.equal(gmRequests[0].headers['X-App'], 'jhb20');
 });

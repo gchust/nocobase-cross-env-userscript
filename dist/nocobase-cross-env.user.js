@@ -1295,6 +1295,37 @@
     return trailingSlash ? `${pathname}/` : pathname;
   }
 
+  function getClientV2PrefixSegment(segment) {
+    return segment === 'v2' || segment === 'v' ? segment : '';
+  }
+
+  function getClientV2PrefixFromPublicPath(publicPath) {
+    const normalized = normalizePath(publicPath || '/');
+    for (const prefix of ['v2', 'v']) {
+      if (normalized.endsWith(`/${prefix}/`)) {
+        return prefix;
+      }
+    }
+    return '';
+  }
+
+  function getClientV2InfoFromPathname(pathname, rootPublicPath = '') {
+    const segments = splitPathSegments(pathname);
+    const rootSegments = rootPublicPath ? splitPathSegments(rootPublicPath) : [];
+    for (let index = rootSegments.length; index < segments.length; index += 1) {
+      const prefix = getClientV2PrefixSegment(segments[index]);
+      if (!prefix) {
+        continue;
+      }
+      return {
+        prefix,
+        rootPublicPath: segmentsToPath(segments.slice(0, index), true),
+        publicPath: segmentsToPath(segments.slice(0, index + 1), true),
+      };
+    }
+    return null;
+  }
+
   function extractNocoBaseAppRoute(pathname) {
     const segments = splitPathSegments(pathname);
     for (let index = 0; index < segments.length - 1; index += 1) {
@@ -1303,15 +1334,18 @@
         continue;
       }
       const appNameSegment = segments[index + 1];
-      const usesV2 = index > 0 && segments[index - 1] === 'v2';
-      const rootSegments = usesV2 ? segments.slice(0, index - 1) : segments.slice(0, index);
+      const clientPrefix = index > 0 ? getClientV2PrefixSegment(segments[index - 1]) : '';
+      const usesClientV2 = Boolean(clientPrefix);
+      const rootSegments = usesClientV2 ? segments.slice(0, index - 1) : segments.slice(0, index);
       const appBaseSegments = segments.slice(0, index + 2);
       const restSegments = segments.slice(index + 2);
       return {
         kind: marker,
         appName: safeDecodeURIComponent(appNameSegment),
         appNameSegment,
-        usesV2,
+        usesV2: usesClientV2,
+        usesClientV2,
+        clientPrefix,
         rootPublicPath: segmentsToPath(rootSegments, true),
         appBasePath: segmentsToPath(appBaseSegments, true),
         restPath: normalizeRelativePath(restSegments.join('/')),
@@ -1322,8 +1356,9 @@
 
   function toRootPublicPath(publicPath) {
     const normalized = normalizePath(publicPath || '/');
-    if (normalized.endsWith('/v2/')) {
-      return normalizePath(normalized.slice(0, -'/v2/'.length) || '/');
+    const clientPrefix = getClientV2PrefixFromPublicPath(normalized);
+    if (clientPrefix) {
+      return normalizePath(normalized.slice(0, -`/${clientPrefix}/`.length) || '/');
     }
     return normalized;
   }
@@ -1334,10 +1369,9 @@
       return route.rootPublicPath;
     }
     const normalizedPathname = normalizePathname(pathname);
-    const marker = '/v2/';
-    const markerIndex = normalizedPathname.indexOf(marker);
-    if (markerIndex >= 0) {
-      return normalizePath(normalizedPathname.slice(0, markerIndex) || '/');
+    const clientV2Info = getClientV2InfoFromPathname(normalizedPathname);
+    if (clientV2Info) {
+      return clientV2Info.rootPublicPath;
     }
     const segments = splitPathSegments(normalizedPathname);
     const entryIndex = segments.findIndex((segment) =>
@@ -1433,11 +1467,12 @@
       return normalizePath(fromRuntime);
     }
     const route = extractNocoBaseAppRoute(location.pathname);
-    if (route?.usesV2) {
-      return joinPath(route.rootPublicPath, 'v2/');
+    if (route?.usesClientV2) {
+      return joinPath(route.rootPublicPath, `${route.clientPrefix}/`);
     }
-    if (normalizePathname(location.pathname).includes('/v2/')) {
-      return joinPath(inferRootPublicPathFromPathname(location.pathname), 'v2/');
+    const clientV2Info = getClientV2InfoFromPathname(location.pathname);
+    if (clientV2Info) {
+      return clientV2Info.publicPath;
     }
     return inferRootPublicPathFromPathname(location.pathname);
   }
@@ -1446,9 +1481,17 @@
     return toRootPublicPath(getCurrentSourcePublicPath());
   }
 
-  function joinMirrorRoute(rootPublicPath, restPath, usesV2) {
+  function normalizeClientV2Prefix(value) {
+    if (value === true) {
+      return 'v2';
+    }
+    return getClientV2PrefixSegment(`${value || ''}`);
+  }
+
+  function joinMirrorRoute(rootPublicPath, restPath, clientV2Prefix) {
     const root = normalizePath(rootPublicPath || '/');
-    const prefix = `${root}${usesV2 ? 'v2/' : ''}`.replace(/\/{2,}/g, '/');
+    const clientPrefix = normalizeClientV2Prefix(clientV2Prefix);
+    const prefix = `${root}${clientPrefix ? `${clientPrefix}/` : ''}`.replace(/\/{2,}/g, '/');
     return joinRoutePath(prefix, restPath || 'admin/');
   }
 
@@ -1482,14 +1525,13 @@
     const currentRoute = extractNocoBaseAppRoute(pathname);
     if (currentRoute) {
       const restPath = currentRoute.restPath || (options.useTargetEntryForRoot ? rule.targetAppEntryPath : '') || 'admin/';
-      return joinMirrorRoute(getSourceRootPublicPathForRule(rule, pathname), restPath, currentRoute.usesV2);
+      return joinMirrorRoute(getSourceRootPublicPathForRule(rule, pathname), restPath, currentRoute.clientPrefix);
     }
 
     const rootPublicPath = getSourceRootPublicPathForRule(rule, pathname);
     const normalizedPathname = normalizePathname(pathname);
-    const v2PublicPath = joinPath(rootPublicPath, 'v2/');
-    const usesV2 = isPathInsidePrefix(normalizedPathname, v2PublicPath);
-    const basePublicPath = usesV2 ? v2PublicPath : rootPublicPath;
+    const clientV2Info = getClientV2InfoFromPathname(normalizedPathname, rootPublicPath);
+    const basePublicPath = clientV2Info ? clientV2Info.publicPath : rootPublicPath;
     let restPath = stripPathPrefix(normalizedPathname, basePublicPath);
 
     if (!restPath && options.useTargetEntryForRoot) {
@@ -1499,20 +1541,23 @@
       restPath = 'admin/';
     }
 
-    return joinMirrorRoute(rootPublicPath, restPath, usesV2);
+    return joinMirrorRoute(rootPublicPath, restPath, clientV2Info?.prefix);
   }
 
   function isSigninPath(pathname) {
     const route = extractNocoBaseAppRoute(pathname);
-    const restPath = route ? route.restPath : normalizeRelativePath(stripPathPrefix(pathname, inferRootPublicPathFromPathname(pathname)));
+    const rootPublicPath = inferRootPublicPathFromPathname(pathname);
+    const clientV2Info = getClientV2InfoFromPathname(pathname, rootPublicPath);
+    const basePublicPath = clientV2Info ? clientV2Info.publicPath : rootPublicPath;
+    const restPath = route ? route.restPath : normalizeRelativePath(stripPathPrefix(pathname, basePublicPath));
     return restPath === 'signin' || restPath.endsWith('/signin');
   }
 
   function buildDefaultSubAppAdminPath(rule, referencePathname = location.pathname) {
     const rootPublicPath = getSourceRootPublicPathForRule(rule, referencePathname);
     const currentRoute = extractNocoBaseAppRoute(referencePathname);
-    const usesV2 = currentRoute?.usesV2 || isPathInsidePrefix(referencePathname, joinPath(rootPublicPath, 'v2/'));
-    return joinMirrorRoute(rootPublicPath, 'admin/', usesV2);
+    const clientV2Info = getClientV2InfoFromPathname(referencePathname, rootPublicPath);
+    return joinMirrorRoute(rootPublicPath, 'admin/', currentRoute?.clientPrefix || clientV2Info?.prefix);
   }
 
   function mapRedirectValueToTargetApp(value, rule) {
@@ -1597,7 +1642,7 @@
     nextUrl.pathname = joinMirrorRoute(
       rootPublicPath,
       targetRoute?.restPath || rule.targetAppEntryPath || 'admin/',
-      Boolean(targetRoute?.usesV2),
+      targetRoute?.clientPrefix || targetRoute?.usesV2,
     );
     nextUrl.search = targetUrl.search || '';
     nextUrl.hash = targetUrl.hash || '';
@@ -2097,11 +2142,11 @@
     const pathname = new URL(targetUrl).pathname || '/';
     const route = extractNocoBaseAppRoute(pathname);
     if (route) {
-      return route.usesV2 ? joinPath(route.rootPublicPath, 'v2/') : route.rootPublicPath;
+      return route.usesClientV2 ? joinPath(route.rootPublicPath, `${route.clientPrefix}/`) : route.rootPublicPath;
     }
-    const markerIndex = pathname.indexOf('/v2/');
-    if (markerIndex >= 0) {
-      return normalizePath(pathname.slice(0, markerIndex + '/v2/'.length));
+    const clientV2Info = getClientV2InfoFromPathname(pathname);
+    if (clientV2Info) {
+      return clientV2Info.publicPath;
     }
     const segments = splitPathSegments(pathname);
     const entryIndex = segments.findIndex((segment) =>
@@ -2153,6 +2198,7 @@
       targetAppName,
       targetAppRouteKind: rule.targetAppRouteKind || targetRoute?.kind || 'apps',
       targetAppUsesV2: Boolean(rule.targetAppUsesV2 || targetRoute?.usesV2),
+      targetAppClientPrefix: rule.targetAppClientPrefix || targetRoute?.clientPrefix || '',
       targetAppEntryPath: normalizeRelativePath(rule.targetAppEntryPath ?? targetRoute?.restPath ?? ''),
       apiBaseUrl: buildSubAppApiBaseUrl(rule.apiBaseUrl, targetAppName),
       wsUrl: rule.wsUrl || '',
@@ -2298,6 +2344,7 @@
       targetAppName: targetRoute?.appName || '',
       targetAppRouteKind: targetRoute?.kind || 'apps',
       targetAppUsesV2: Boolean(targetRoute?.usesV2),
+      targetAppClientPrefix: targetRoute?.clientPrefix || '',
       targetAppEntryPath: targetRoute?.restPath || '',
       apiBaseUrl,
       wsPath,
@@ -2380,6 +2427,25 @@
         pathname = `/${pathname}`;
       }
       return pathname.replace(/\/{2,}/g, '/').replace(/\/$/g, '') || '/ws';
+    }
+
+    function getClientV2PrefixFromPublicPath(publicPath) {
+      const normalized = normalizePath(publicPath || '/', '/');
+      for (const prefix of ['v2', 'v']) {
+        if (normalized.endsWith(`/${prefix}/`)) {
+          return prefix;
+        }
+      }
+      return '';
+    }
+
+    function toRootPublicPath(publicPath) {
+      const normalized = normalizePath(publicPath || '/', '/');
+      const clientPrefix = getClientV2PrefixFromPublicPath(normalized);
+      if (clientPrefix) {
+        return normalizePath(normalized.slice(0, -`/${clientPrefix}/`.length) || '/', '/');
+      }
+      return normalized;
     }
 
     function isSpecialSchemeUrl(value) {
@@ -2466,15 +2532,22 @@
       if (rule.sourceApiBaseUrl) {
         return new URL(rule.sourceApiBaseUrl, location.origin).toString();
       }
-      const rootPublicPath = getSourcePublicPath().endsWith('/v2/')
-        ? normalizePath(getSourcePublicPath().slice(0, -'/v2/'.length) || '/', '/')
-        : getSourcePublicPath();
+      const rootPublicPath = toRootPublicPath(getSourcePublicPath());
       const fallbackPath = rootPublicPath === '/' ? '/api/' : `${rootPublicPath}api/`;
       return new URL(fallbackPath, location.origin).toString();
     }
 
     function getSourceApiPathname() {
       return new URL(getSourceApiBaseUrl(), location.origin).pathname;
+    }
+
+    function getSourceApiPathnames() {
+      const pathnames = new Set([normalizePath(getSourceApiPathname(), '/api/')]);
+      const clientPublicPath = getSourcePublicPath();
+      if (getClientV2PrefixFromPublicPath(clientPublicPath)) {
+        pathnames.add(normalizePath(`${clientPublicPath}api/`, '/api/'));
+      }
+      return Array.from(pathnames);
     }
 
     function getTargetApiBaseUrl() {
@@ -2490,11 +2563,13 @@
     }
 
     function getSourceStoragePrefixes() {
-      const publicPath = getSourcePublicPath().endsWith('/v2/')
-        ? normalizePath(getSourcePublicPath().slice(0, -'/v2/'.length) || '/', '/')
-        : getSourcePublicPath();
-      const main = publicPath === '/' ? '/storage/uploads/' : `${publicPath}storage/uploads/`;
+      const publicPath = getSourcePublicPath();
+      const rootPublicPath = toRootPublicPath(publicPath);
+      const main = rootPublicPath === '/' ? '/storage/uploads/' : `${rootPublicPath}storage/uploads/`;
       const prefixes = new Set([normalizePath(main, '/storage/uploads/')]);
+      if (getClientV2PrefixFromPublicPath(publicPath)) {
+        prefixes.add(normalizePath(`${publicPath}storage/uploads/`, '/storage/uploads/'));
+      }
       prefixes.add(normalizePath(rule.storagePath, '/storage/uploads/'));
       return Array.from(prefixes);
     }
@@ -2517,10 +2592,11 @@
         ? new URL(joinApiEndpoint(getSourceApiBaseUrl(), rawInput))
         : new URL(rawInput, location.href);
       const targetApiUrl = getTargetApiUrl();
-      const sourceApiPathname = normalizePath(getSourceApiPathname(), '/api/');
+      const sourceApiPathnames = getSourceApiPathnames();
       const targetApiPathname = normalizePath(targetApiUrl.pathname, '/api/');
 
-      if (isSameOriginUrl(resolved) && matchesPathPrefix(resolved.pathname, sourceApiPathname)) {
+      const sourceApiPathname = sourceApiPathnames.find((pathname) => matchesPathPrefix(resolved.pathname, pathname));
+      if (isSameOriginUrl(resolved) && sourceApiPathname) {
         const suffix = stripPathPrefix(resolved.pathname, sourceApiPathname);
         const rewritten = new URL(targetApiUrl.toString());
         rewritten.pathname = `${targetApiPathname}${suffix}`.replace(/\/{2,}/g, '/');
@@ -5539,6 +5615,14 @@
       resolveVisibleDebugSelection,
       buildDebugCopyPayload,
       buildPanelStatusSummary,
+      extractNocoBaseAppRoute,
+      toRootPublicPath,
+      derivePublicPathFromUrl,
+      getCurrentSourcePublicPath,
+      getCurrentSourceRootPublicPath,
+      buildTargetAppPathForPathname,
+      buildDefaultSubAppAdminPath,
+      buildLocalEntryHref,
       splitNocoBaseEndpoint,
       formatSemanticFilterNode,
       formatDebugQuery,
